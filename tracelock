@@ -1,58 +1,199 @@
 #!/usr/bin/env python3
-import argparse,hashlib,json,os,shutil,subprocess,time
-from datetime import datetime,timezone
+"""TraceLock: local command reproducibility records."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT=Path(os.environ.get("TRACELOCK_HOME",Path.home()/".tracelock"))
+ROOT = Path(os.environ.get("TRACELOCK_HOME", Path.home() / ".tracelock"))
+SENSITIVE_ENV_WORDS = ("key", "token", "secret", "password", "passwd", "cookie", "auth")
 
-def sha(data): return hashlib.sha256(data).hexdigest()
 
-def safe_env():
- out={}
- for k,v in os.environ.items():
-  if any(x in k.lower() for x in ("key","token","secret","password","passwd","cookie","auth")): continue
-  out[k]=v[:200]+("..." if len(v)>200 else "")
- return out
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-def version_probe(exe):
- for flag in ("--version","-V","version"):
-  try:
-   p=subprocess.run([exe,flag],capture_output=True,text=True,timeout=3)
-   lines=(p.stdout or p.stderr).strip().splitlines()
-   if lines: return lines[0][:300]
-  except Exception: pass
- return None
 
-def execute(argv):
- ROOT.mkdir(parents=True,exist_ok=True)
- run_id=datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")+"-"+sha("\0".join(argv).encode())[:8]
- start=datetime.now(timezone.utc).isoformat(); t0=time.monotonic()
- p=subprocess.run(argv,capture_output=True,text=False)
- duration=time.monotonic()-t0; out=p.stdout or b""; err=p.stderr or b""
- rec={"id":run_id,"started":start,"duration_seconds":round(duration,6),"argv":argv,
-      "cwd":os.getcwd(),"executable":shutil.which(argv[0]),"tool_version":version_probe(argv[0]),
-      "exit_code":p.returncode,"stdout_sha256":sha(out),"stderr_sha256":sha(err),
-      "stdout":out.decode(errors="replace"),"stderr":err.decode(errors="replace"),
-      "environment":safe_env()}
- (ROOT/(run_id+".json")).write_text(json.dumps(rec,indent=2,sort_keys=True))
- print("TraceLock:",run_id)
- print("exit=",p.returncode,"duration=",round(duration,3),"s")
- print("record=",ROOT/(run_id+".json"))
- return p.returncode
+def safe_environment() -> dict[str, str]:
+    result = {}
+    for key, value in os.environ.items():
+        if any(word in key.lower() for word in SENSITIVE_ENV_WORDS):
+            continue
+        result[key] = value[:200] + ("..." if len(value) > 200 else "")
+    return dict(sorted(result.items()))
 
-def main():
- ap=argparse.ArgumentParser(description="TraceLock command reproducibility wrapper")
- ap.add_argument("command",nargs=argparse.REMAINDER); a=ap.parse_args()
- cmd=a.command[1:] if a.command and a.command[0]=="--" else a.command
- if cmd and cmd[0]=="list":
-  ROOT.mkdir(parents=True,exist_ok=True)
-  [print(p.stem) for p in sorted(ROOT.glob("*.json"))]; return 0
- if cmd and cmd[0]=="show":
-  if len(cmd)!=2: raise SystemExit("usage: tracelock show RUN_ID")
-  p=ROOT/(cmd[1]+".json")
-  if not p.is_file(): raise SystemExit("run not found")
-  print(p.read_text()); return 0
- if not cmd: ap.print_help(); return 2
- return execute(cmd)
 
-if __name__=="__main__": raise SystemExit(main())
+def version_probe(executable: str) -> str | None:
+    for flag in ("--version", "-V", "version"):
+        try:
+            proc = subprocess.run(
+                [executable, flag],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+        lines = (proc.stdout or proc.stderr).strip().splitlines()
+        if lines:
+            return lines[0][:300]
+    return None
+
+
+def command_record(argv: list[str], capture: bool = True) -> int:
+    if not argv:
+        print("TraceLock: no command supplied", file=sys.stderr)
+        return 2
+
+    ROOT.mkdir(parents=True, exist_ok=True)
+
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        + "-"
+        + sha256("\0".join(argv).encode("utf-8"))[:8]
+    )
+    started = datetime.now(timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
+
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=capture,
+            text=False,
+            check=False,
+        )
+    except FileNotFoundError:
+        print(f"TraceLock: command not found: {argv[0]}", file=sys.stderr)
+        return 127
+    except OSError as exc:
+        print(f"TraceLock: failed to start command: {exc}", file=sys.stderr)
+        return 126
+
+    duration = time.monotonic() - started_monotonic
+    stdout = proc.stdout or b""
+    stderr = proc.stderr or b""
+
+    record = {
+        "schema": 1,
+        "id": run_id,
+        "started": started,
+        "duration_seconds": round(duration, 6),
+        "argv": argv,
+        "cwd": os.getcwd(),
+        "executable": shutil.which(argv[0]),
+        "tool_version": version_probe(argv[0]),
+        "exit_code": proc.returncode,
+        "stdout_sha256": sha256(stdout),
+        "stderr_sha256": sha256(stderr),
+        "captured_output": capture,
+        "stdout": stdout.decode("utf-8", errors="replace") if capture else None,
+        "stderr": stderr.decode("utf-8", errors="replace") if capture else None,
+        "environment": safe_environment(),
+    }
+
+    destination = ROOT / f"{run_id}.json"
+    destination.write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"TraceLock: {run_id}")
+    print(f"exit={proc.returncode} duration={duration:.3f}s")
+    print(f"record={destination}")
+
+    return proc.returncode
+
+
+def list_records() -> int:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    records = sorted(ROOT.glob("*.json"))
+    if not records:
+        print("TraceLock: no records")
+        return 0
+
+    for path in records:
+        print(path.stem)
+    return 0
+
+
+def show_record(run_id: str) -> int:
+    path = ROOT / f"{run_id}.json"
+    if not path.is_file():
+        print(f"TraceLock: record not found: {run_id}", file=sys.stderr)
+        return 2
+
+    print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def verify_record(run_id: str) -> int:
+    path = ROOT / f"{run_id}.json"
+    if not path.is_file():
+        print(f"TraceLock: record not found: {run_id}", file=sys.stderr)
+        return 2
+
+    record = json.loads(path.read_text(encoding="utf-8"))
+    command = record.get("argv")
+    if not isinstance(command, list) or not command:
+        print("TraceLock: invalid argv in record", file=sys.stderr)
+        return 3
+
+    print(f"id: {run_id}")
+    print(f"argv: {' '.join(command)}")
+    print(f"recorded_exit: {record.get('exit_code')}")
+    print(f"stdout_sha256: {record.get('stdout_sha256')}")
+    print(f"stderr_sha256: {record.get('stderr_sha256')}")
+    print("Note: verification checks record structure only; it does not rerun the command.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Record how a local command was run without replaying it."
+    )
+    parser.add_argument(
+        "action",
+        nargs="+",
+        help="Use: -- COMMAND, list, show RUN_ID, or verify RUN_ID.",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Do not retain stdout/stderr text. Hashes are still recorded.",
+    )
+    args = parser.parse_args()
+
+    action = args.action
+    if action and action[0] == "--":
+        action = action[1:]
+
+    if action and action[0] == "list":
+        return list_records()
+
+    if action and action[0] == "show":
+        if len(action) != 2:
+            print("usage: tracelock show RUN_ID", file=sys.stderr)
+            return 2
+        return show_record(action[1])
+
+    if action and action[0] == "verify":
+        if len(action) != 2:
+            print("usage: tracelock verify RUN_ID", file=sys.stderr)
+            return 2
+        return verify_record(action[1])
+
+    return command_record(action, capture=not args.no_capture)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import argparse,hashlib,json,os,shutil,subprocess,time
+from datetime import datetime,timezone
+from pathlib import Path
+
+ROOT=Path(os.environ.get("TRACELOCK_HOME",Path.home()/".tracelock"))
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+
+def safe_env():
+ out={}
+ for k,v in os.environ.items():
+  if any(x in k.lower() for x in ("key","token","secret","password","passwd","cookie","auth")): continue
+  out[k]=v[:200]+("..." if len(v)>200 else "")
+ return out
+
+def version_probe(exe):
+ for flag in ("--version","-V","version"):
+  try:
+   p=subprocess.run([exe,flag],capture_output=True,text=True,timeout=3)
+   lines=(p.stdout or p.stderr).strip().splitlines()
+   if lines: return lines[0][:300]
+  except Exception: pass
+ return None
+
+def execute(argv):
+ ROOT.mkdir(parents=True,exist_ok=True)
+ run_id=datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")+"-"+sha("\0".join(argv).encode())[:8]
+ start=datetime.now(timezone.utc).isoformat(); t0=time.monotonic()
+ p=subprocess.run(argv,capture_output=True,text=False)
+ duration=time.monotonic()-t0; out=p.stdout or b""; err=p.stderr or b""
+ rec={"id":run_id,"started":start,"duration_seconds":round(duration,6),"argv":argv,
+      "cwd":os.getcwd(),"executable":shutil.which(argv[0]),"tool_version":version_probe(argv[0]),
+      "exit_code":p.returncode,"stdout_sha256":sha(out),"stderr_sha256":sha(err),
+      "stdout":out.decode(errors="replace"),"stderr":err.decode(errors="replace"),
+      "environment":safe_env()}
+ (ROOT/(run_id+".json")).write_text(json.dumps(rec,indent=2,sort_keys=True))
+ print("TraceLock:",run_id)
+ print("exit=",p.returncode,"duration=",round(duration,3),"s")
+ print("record=",ROOT/(run_id+".json"))
+ return p.returncode
+
+def main():
+ ap=argparse.ArgumentParser(description="TraceLock command reproducibility wrapper")
+ ap.add_argument("command",nargs=argparse.REMAINDER); a=ap.parse_args()
+ cmd=a.command[1:] if a.command and a.command[0]=="--" else a.command
+ if cmd and cmd[0]=="list":
+  ROOT.mkdir(parents=True,exist_ok=True)
+  [print(p.stem) for p in sorted(ROOT.glob("*.json"))]; return 0
+ if cmd and cmd[0]=="show":
+  if len(cmd)!=2: raise SystemExit("usage: tracelock show RUN_ID")
+  p=ROOT/(cmd[1]+".json")
+  if not p.is_file(): raise SystemExit("run not found")
+  print(p.read_text()); return 0
+ if not cmd: ap.print_help(); return 2
+ return execute(cmd)
+
+if __name__=="__main__": raise SystemExit(main())
